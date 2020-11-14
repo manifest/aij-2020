@@ -26,6 +26,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -109,11 +110,42 @@ class LineByLineTextDataset(Dataset):
     def __getitem__(self, i):
         return torch.tensor(self.examples[i], dtype=torch.long)
 
+class LineByLineV2TextDataset(Dataset):
+    def __init__(self, tokenizer: PreTrainedTokenizer, args, file_path: str, block_size=512):
+        assert os.path.isfile(file_path)
+        # Here, we do not cache the features, operating under the assumption
+        # that we will soon use fast multithreaded tokenizers from the
+        # `tokenizers` repo everywhere =)
+        logger.info("Creating features from dataset file at %s", file_path)
+
+        with open(file_path, encoding="utf-8") as f:
+            lines = [line for line in f.read().splitlines() if (len(line) > 0 and not line.isspace())]
+
+        acc = []
+        for line in lines:
+            example = tokenizer.encode(line, add_special_tokens=True)
+            maxn = len(example)
+            try:
+                bos_token_index = example.index(tokenizer.bos_token_id)
+            except:
+                logger.info("The example \"{}\" doesn not incude a \"BOS\" token.".format(example))
+            for n in range(bos_token_index+1, maxn):
+                acc.append(example[:n+1] + ([tokenizer.pad_token_id] * (block_size-n-1)))
+        self.examples = torch.tensor(acc)
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i):
+        return torch.tensor(self.examples[i], dtype=torch.long)
+
 
 def load_and_cache_examples(args, tokenizer, evaluate=False):
     file_path = args.eval_data_file if evaluate else args.train_data_file
     if args.line_by_line:
         return LineByLineTextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
+    elif args.line_by_line_v2:
+        return LineByLineV2TextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
     else:
         return TextDataset(tokenizer, args, file_path=file_path, block_size=args.block_size)
 
@@ -143,7 +175,6 @@ def _sorted_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
     checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
     return checkpoints_sorted
 
-
 def _rotate_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -> None:
     if not args.save_total_limit:
         return
@@ -161,6 +192,47 @@ def _rotate_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
         logger.info("Deleting older checkpoint [{}] due to args.save_total_limit".format(checkpoint))
         shutil.rmtree(checkpoint)
 
+def _count_layers(model):
+    index = 0
+    for name, param in model.base_model.named_parameters():
+        parts = name.split(".")
+        label = parts[0]
+        if label == "h":
+            layer = int(parts[1])
+            if index < layer:
+                index = layer
+    return index
+
+def _freeze_layers(model, n_keep=0):
+    acc = []
+    n = _count_layers(model)
+    last_frozen_index = n - n_keep
+    for name, params in model.base_model.named_parameters():
+        parts = name.split(".")
+        label = parts[0]
+        if label == "h":
+            layer = int(parts[1])
+            if layer <= last_frozen_index:
+                params.requires_grad = False
+
+        if params.requires_grad == True:
+            acc.append(name)
+
+    return acc
+
+def _bos_token_index(inputs, bos_token_id):
+    bos_token_index = torch.nonzero(inputs.view(-1) == bos_token_id)
+    bos_token_index = None if len(bos_token_index) == 0 else int(bos_token_index)
+    return bos_token_index
+
+def _masked_cross_entropy(logits, labels, bos_token_index, ignore_index):
+    assert logits.shape[0] == 1, "A single batch is only supported."
+    if bos_token_index != None:
+        for index in range(bos_token_index+1):
+            logits[0,index,:] = 0.
+    shift_labels = labels[..., 1:].contiguous()
+    shift_logits = logits[..., :-1, :].contiguous()
+    return F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index = ignore_index)
 
 def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args) -> Tuple[torch.Tensor, torch.Tensor]:
     """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
@@ -195,7 +267,6 @@ def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args) -> T
 
     # The rest of the time (10% of the time) we keep the masked input tokens unchanged
     return inputs, labels
-
 
 def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedTokenizer) -> Tuple[int, float]:
     """ Train the model """
@@ -298,7 +369,6 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
             logger.info("  Starting fine-tuning.")
 
     tr_loss, logging_loss = 0.0, 0.0
-
     model.zero_grad()
     train_iterator = trange(
         epochs_trained, int(args.num_train_epochs), desc="Epoch", disable=args.local_rank not in [-1, 0]
@@ -318,7 +388,12 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
             labels = labels.to(args.device)
             model.train()
             outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
-            loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+            # loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
+            ## NOTE: mask control sequence
+            logits = outputs[1]
+            bos_token_index = _bos_token_index(inputs, bos_token_id=tokenizer.bos_token_id)
+            loss = _masked_cross_entropy(logits, labels, bos_token_index, ignore_index=tokenizer.pad_token_id)
+            ##
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -467,6 +542,12 @@ def main():
 
     # Other parameters
     parser.add_argument(
+        "--layers_to_train",
+        default=None,
+        type=int,
+        help="An optional number of layers that will be trained.",
+    )
+    parser.add_argument(
         "--eval_data_file",
         default=None,
         type=str,
@@ -476,6 +557,11 @@ def main():
         "--line_by_line",
         action="store_true",
         help="Whether distinct lines of text in the dataset are to be handled as distinct sequences.",
+    )
+    parser.add_argument(
+        "--line_by_line_v2",
+        action="store_true",
+        help="Whether distinct lines of text in the dataset are to be handled as distinct sequences (v2).",
     )
     parser.add_argument(
         "--should_continue", action="store_true", help="Whether to continue from latest checkpoint in output_dir"
@@ -707,6 +793,15 @@ def main():
     else:
         logger.info("Training new model from scratch")
         model = AutoModelWithLMHead.from_config(config)
+
+    ## NOTE: add special tokens.
+    special_tokens_dict = {'bos_token': '[BOS]', 'eos_token': '[EOS]', 'pad_token': '[PAD]'}
+    tokenizer.add_special_tokens(special_tokens_dict)
+    ## NOTE: freeze layers
+    if args.layers_to_train:
+        train_layers = _freeze_layers(model, n_keep=args.layers_to_train)
+        print("Layers to train:\n  {}.".format("\n  ".join(train_layers)))
+    ##
 
     model.to(args.device)
 
