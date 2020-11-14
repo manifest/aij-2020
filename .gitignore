@@ -11,4 +11,5 @@ Session.vim
 
 # Python
 env
+data
 __pycache__
