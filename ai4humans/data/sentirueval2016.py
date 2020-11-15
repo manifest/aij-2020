@@ -170,6 +170,8 @@ def read_documents(path):
       if attr_name in SUBJECTID and col.text != "NULL":
         ## Add act with/without subject
         doc["acts"].add((("subject", subject_label(attr_name)), ("sentiment", sentiment_label(col.text))))
+        doc["acts"].add((("sentiment", sentiment_label(col.text)),))
+        doc["acts"].add(())
         doc["domain"] = subject_domain(attr_name)
         doc["subjects"].add(attr_name)
     acc.append(doc)
