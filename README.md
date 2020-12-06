@@ -1,14 +1,17 @@
 #  AI Journey 2020 competition
 
-A solution for "AI 4 Humanities: ruGPT-3" track of the [AI Journey 2020 competition](https://ai-journey.ru/en/contest).
+A winning (1st place) solution for "AI 4 Humanities: ruGPT-3" track of the [AI Journey 2020 competition](https://ai-journey.ru/en/contest).
 
+In the work, I use pre-trained ruGPT-3 model for the task of semantically controlled response generation in context of goal-oriented dialog systems. The work is highly influenced by [Peng et. al 2020](https://arxiv.org/abs/2002.12328) and details may be found in the [presentation](docs/ai4humans.nesterov.pdf) (ru).
 
-## How to use
+A model trained on RuCoS dataset:
+- [Text generation](https://colab.research.google.com/drive/1lxNUY-gzeSDVXnZegteBCakET90Rj4Gf?usp=sharing) (colab)
+- [Training of the model](https://colab.research.google.com/drive/18r0v7zaWrNtv565iEOa7BONYqG5vg88I?usp=sharing) (colab)
 
-```bash
-tar xzf data.tar.gz
-```
-> Unzip data.
+A model trained on SentiRuEval_2016 dataset:
+- [Text generation](https://colab.research.google.com/drive/1Y_gy9CvPPaCvfCcp1dcYSi-tXlQjUPV6?usp=sharing) (colab)
+- [Training of the model](https://colab.research.google.com/drive/1mW_hEaYlQbBvqWgQjpXzU88_IlE-1f9V?usp=sharing) (colab)
+
 
 
 ## Copyright notices
